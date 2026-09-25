@@ -15,7 +15,8 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Text;
+using System.Linq;
+using System.Text.RegularExpressions;
 
 namespace WordStat;
 
@@ -25,24 +26,10 @@ public static class WordAnalyzer {
   /// <param name="text">Raw input text.</param>
   /// <returns>A list of lowercase word tokens.</returns>
   public static List<string> Tokenize(string text) {
-    var words = new List<string>();
-    var current = new StringBuilder();
-    foreach (char ch in text) {
-      if (char.IsLetter(ch)) {
-        // Sub-optimal: string concatenation per character via
-        // StringBuilder.Append still O(1) amortized, but this loop
-        // mirrors the Python "before" state's per-char handling
-        // rather than a single regex pass.
-        current.Append(char.ToLowerInvariant(ch));
-      } else {
-        if (current.Length > 0) {
-          words.Add(current.ToString());
-          current.Clear();
-        }
-      }
-    }
-    if (current.Length > 0) {
-      words.Add(current.ToString());
+    var matches = Regex.Matches(text.ToLowerInvariant(), "[a-z]+");
+    var words = new List<string>(matches.Count);
+    foreach (Match match in matches) {
+      words.Add(match.Value);
     }
     return words;
   }
@@ -51,19 +38,18 @@ public static class WordAnalyzer {
   /// <param name="words">Tokenized words.</param>
   /// <returns>Pairs of (word, count), order of first appearance.</returns>
   public static List<WordCount> CountWords(List<string> words) {
-    var counts = new List<WordCount>();
+    var map = new Dictionary<string, int>();
     foreach (var word in words) {
-      var found = false;
-      for (var i = 0; i < counts.Count; i++) {
-        if (counts[i].Word == word) {
-          counts[i] = new WordCount(counts[i].Word, counts[i].Count + 1);
-          found = true;
-          break;
-        }
+      if (map.TryGetValue(word, out var val)) {
+        map[word] = val + 1;
+      } else {
+        map[word] = 1;
       }
-      if (!found) {
-        counts.Add(new WordCount(word, 1));
-      }
+    }
+
+    var counts = new List<WordCount>(map.Count);
+    foreach (var kvp in map) {
+      counts.Add(new WordCount(kvp.Key, kvp.Value));
     }
     return counts;
   }
@@ -73,20 +59,10 @@ public static class WordAnalyzer {
   /// <param name="n">Number of top entries to return.</param>
   /// <returns>Up to n entries sorted by count descending.</returns>
   public static List<WordCount> TopNWords(List<WordCount> counts, int n) {
-    var remaining = new List<WordCount>(counts);
-    var result = new List<WordCount>();
-    var take = Math.Min(n, remaining.Count);
-    for (var i = 0; i < take; i++) {
-      var bestIndex = 0;
-      for (var j = 1; j < remaining.Count; j++) {
-        if (remaining[j].Count > remaining[bestIndex].Count) {
-          bestIndex = j;
-        }
-      }
-      result.Add(remaining[bestIndex]);
-      remaining.RemoveAt(bestIndex);
-    }
-    return result;
+    return counts
+        .OrderByDescending(wc => wc.Count)
+        .Take(n)
+        .ToList();
   }
 
   /// <summary>Runs the full analysis pipeline on a text blob.</summary>
@@ -187,4 +163,3 @@ public static class Program {
     return 0;
   }
 }
-

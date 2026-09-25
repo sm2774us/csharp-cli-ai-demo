@@ -1,0 +1,11 @@
+<Project>
+
+  <PropertyGroup>
+    <Company>csharp-cli-ai-demo</Company>
+    <Authors>csharp-cli-ai-demo contributors</Authors>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+</Project>

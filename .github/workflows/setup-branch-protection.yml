@@ -1,0 +1,76 @@
+name: setup-branch-protection
+
+# Run this ONCE, manually, right after you first push this repo. It
+# does not touch code -- it configures a GitHub branch protection rule
+# so that NO pull request (including ones ai-improve.yml opens) can be
+# merged without at least one human approval, even if a future change
+# to ai-improve.yml adds an auto-merge step by mistake. This is
+# enforcement at the GitHub level, not just workflow behavior.
+#
+# IMPORTANT: the branch protection API is admin-only. The built-in
+# GITHUB_TOKEN can NEVER call it, no matter what `permissions:` block
+# is set -- "administration" isn't even a grantable scope for it (GitHub
+# will reject the workflow file outright if you try). This is a hard
+# platform limitation, not a bug: see
+# https://docs.github.com/rest/branches/branch-protection
+# So this workflow requires a real Personal Access Token with repo
+# Administration (write) permission, stored as the repo secret
+# ADMIN_PAT. One-time setup for that token:
+#   1. https://github.com/settings/personal-access-tokens/new
+#   2. Token type: Fine-grained. Repository access: only this repo.
+#   3. Repository permissions -> Administration: Read and write.
+#      (Metadata: Read gets auto-selected -- leave it.)
+#   4. Generate, copy it, then: gh secret set ADMIN_PAT
+#
+# If you'd rather not create a PAT for this, skip this workflow
+# entirely and do the one-time equivalent by hand instead: repo ->
+# Settings -> Branches -> Add branch protection rule -> require 1
+# approval + the "test" status check -> Save. Same end result, no
+# token needed.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  protect-main:
+    runs-on: ubuntu-latest
+    steps:
+      # github.ref_name is this run's actual branch name (whatever the
+      # repo's default branch is actually called -- not assumed to be
+      # "main"; plain `git init` still defaults to "master" unless
+      # init.defaultBranch is configured).
+      - name: Require pull request review + passing CI before merge
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "error: the ADMIN_PAT repo secret is not set." >&2
+            echo "Branch protection is an admin-only GitHub API that the" >&2
+            echo "built-in GITHUB_TOKEN can never call. See the comment at" >&2
+            echo "the top of this workflow file for how to create and set" >&2
+            echo "a fine-grained PAT with Administration:write, or just do" >&2
+            echo "this one-time step by hand in repo Settings -> Branches." >&2
+            exit 1
+          fi
+
+          branch="${{ github.ref_name }}"
+          echo "protecting branch: $branch"
+          gh api \
+            --method PUT \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${{ github.repository }}/branches/$branch/protection" \
+            -F 'required_status_checks[strict]=true' \
+            -f 'required_status_checks[contexts][]=test' \
+            -F 'enforce_admins=true' \
+            -F 'required_pull_request_reviews[required_approving_review_count]=1' \
+            -F 'required_pull_request_reviews[dismiss_stale_reviews]=true' \
+            -F 'restrictions=null' \
+            -F 'allow_force_pushes=false' \
+            -F 'allow_deletions=false'
+
+      - name: Confirm the rule is active
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+        run: |
+          branch="${{ github.ref_name }}"
+          gh api "repos/${{ github.repository }}/branches/$branch/protection" \
+            --jq '{required_reviews: .required_pull_request_reviews.required_approving_review_count, required_checks: .required_status_checks.contexts, enforce_admins: .enforce_admins.enabled}'

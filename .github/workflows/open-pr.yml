@@ -1,0 +1,85 @@
+name: open-pr
+
+# For manual, human-written code changes: you create your own feature
+# branch, commit and push to it yourself, ci.yml gives you format/test
+# feedback on every push -- and once you're done, run this workflow to
+# open the PR for you. It does NOT approve or merge anything; that
+# stays a manual step, exactly like ai-improve.yml's PRs, enforced the
+# same way by branch protection.
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Your feature branch name (e.g. feature/my-change)"
+        required: true
+      title:
+        description: "PR title (defaults to the branch name if left blank)"
+        required: false
+      body:
+        description: "PR description (optional)"
+        required: false
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore
+        run: dotnet restore csharp-cli-ai-demo.sln
+
+      # Redundant with ci.yml's own run on this branch, deliberately --
+      # this is the actual gate for whether a PR gets opened at all, so
+      # it doesn't rely on trusting an earlier run finished or passed.
+      - name: Verify the branch is clean before opening a PR
+        run: |
+          dotnet format --verify-no-changes
+          dotnet test tests/WordStat.Tests/WordStat.Tests.csproj \
+            -p:CollectCoverage=true -p:Threshold=100 \
+            -p:ThresholdType=\"line,branch\" -p:ThresholdStat=total
+
+      - name: Determine the repository's default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          default_branch=$(gh api "repos/${{ github.repository }}" --jq '.default_branch')
+          echo "BASE_BRANCH=$default_branch" >> "$GITHUB_ENV"
+          echo "base branch: $default_branch"
+
+      - name: Confirm there's actually something to open a PR for
+        run: |
+          count=$(git rev-list --count "origin/$BASE_BRANCH"..HEAD)
+          if [ "$count" -eq 0 ]; then
+            echo "error: '${{ inputs.branch }}' has no commits ahead of $BASE_BRANCH -- nothing to open a PR for." >&2
+            exit 1
+          fi
+          echo "commits ahead of $BASE_BRANCH: $count"
+
+      - name: Open the PR (approval/merge stays manual)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="${{ inputs.title }}"
+          if [ -z "$title" ]; then
+            title="${{ inputs.branch }}"
+          fi
+          body="${{ inputs.body }}"
+          if [ -z "$body" ]; then
+            body="Opened via open-pr.yml from branch \`${{ inputs.branch }}\`. This PR requires manual human review and approval before merge. No auto-merge is configured."
+          fi
+          gh pr create \
+            --title "$title" \
+            --body "$body" \
+            --base "$BASE_BRANCH" \
+            --head "${{ inputs.branch }}"

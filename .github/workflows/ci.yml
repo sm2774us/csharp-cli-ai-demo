@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  # branches: ['**'] matches every branch (including your own feature
+  # branches) but not tags -- a bare `push:` with no filter also fires
+  # on the tags changelog-release.yml creates, which would be a
+  # redundant, pointless CI run on every release.
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore
+        run: dotnet restore csharp-cli-ai-demo.sln
+
+      - name: Build (dotnet build)
+        run: dotnet build csharp-cli-ai-demo.sln --no-restore --configuration Release
+
+      - name: Format check (Google C# style via .editorconfig)
+        run: dotnet format --verify-no-changes
+
+      - name: Test with 100% coverage gate
+        run: |
+          dotnet test tests/WordStat.Tests/WordStat.Tests.csproj \
+            -p:CollectCoverage=true \
+            -p:CoverletOutputFormat=cobertura \
+            -p:Threshold=100 \
+            -p:ThresholdType=\"line,branch\" \
+            -p:ThresholdStat=total
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-cobertura
+          path: tests/WordStat.Tests/coverage.cobertura.xml
+          if-no-files-found: warn

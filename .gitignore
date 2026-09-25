@@ -1,0 +1,11 @@
+bin/
+obj/
+*.user
+.vs/
+TestResults/
+coverage.cobertura.xml
+coverage.json
+**/CoverageReport/
+before.txt
+after.txt
+ai_improve_log.txt

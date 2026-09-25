@@ -1,0 +1,139 @@
+name: ai-improve
+
+# Manual gate: this workflow NEVER runs on push. It only runs when a human
+# triggers it from the Actions tab (or `gh workflow run ai-improve.yml`),
+# and it ends with a Pull Request that still requires manual review/merge.
+# This is the human-supervision gate for AI-authored code changes.
+#
+# Uses ONLY the free-tier Gemini REST API (gemini-3.5-flash-lite) called
+# directly with curl-equivalent Python (urllib) - no SDK, no third-party
+# Action, no Claude/OpenAI (neither offers a free API tier).
+on:
+  workflow_dispatch:
+    inputs:
+      instruction:
+        description: 'Instruction for the AI, e.g. "improve algorithm and performance"'
+        required: true
+        default: "improve algorithm and performance"
+
+jobs:
+  ai-improve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore
+        run: dotnet restore csharp-cli-ai-demo.sln
+
+      - name: Baseline tests (must pass before AI touches anything)
+        run: dotnet test tests/WordStat.Tests/WordStat.Tests.csproj
+
+      - name: Create working branch
+        run: |
+          # github.ref_name is the actual branch this workflow was
+          # triggered on (whatever it's named -- main, master, or
+          # anything else) rather than a hardcoded assumption. Every
+          # downstream --base / diff uses this instead of "main"
+          # literally, since a repo's default branch isn't guaranteed
+          # to be named "main" (plain `git init` still defaults to
+          # "master" unless init.defaultBranch is configured).
+          echo "BASE_BRANCH=${{ github.ref_name }}" >> "$GITHUB_ENV"
+          echo "base branch: ${{ github.ref_name }}"
+
+          branch="ai-improve/$(date +%Y%m%d-%H%M%S)"
+          echo "BRANCH=$branch" >> "$GITHUB_ENV"
+          git checkout -b "$branch"
+
+      # ---- Free-tier agent: Gemini (gemini-3.5-flash-lite via REST) ----
+      # Requires repo secret GEMINI_API_KEY (Google AI Studio free tier).
+      #
+      # This single step owns the entire self-heal loop: it measures the
+      # baseline benchmark itself, calls Gemini, then on every attempt
+      # runs dotnet format/comment-wrap, the hard format+test gates, AND
+      # a real benchmark comparison against that baseline -- feeding
+      # back the exact failure (format, test, or "not actually faster")
+      # to Gemini for another attempt, up to 4 tries. It only exits 0
+      # once the code is clean AND measurably faster.
+      #
+      # IMPORTANT: output is redirected to a file (not piped through
+      # `tee`), because a pipe hides the real command's exit code
+      # behind `tee`'s (which is always 0) unless `pipefail` is set --
+      # that would silently let a failed AI attempt "succeed" past this
+      # step and try to open an empty PR. Capturing $? explicitly here
+      # guarantees a failed self-heal genuinely fails the job before
+      # any commit/push/PR step runs.
+      - name: Run Gemini to rewrite source + tests (self-healing)
+        id: ai
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set +e
+          python3 scripts/ai_improve.py \
+            --instruction "${{ inputs.instruction }}" \
+            --file src/WordStat/Program.cs \
+            --tests tests/WordStat.Tests/ProgramTests.cs \
+            > ai_improve_log.txt 2>&1
+          exit_code=$?
+          set -e
+          cat ai_improve_log.txt
+          if [ "$exit_code" -ne 0 ]; then
+            echo "ai_improve.py failed (exit $exit_code) -- aborting before any commit/push/PR." >&2
+            exit "$exit_code"
+          fi
+
+      - name: Final verification (belt-and-suspenders)
+        run: |
+          dotnet format --verify-no-changes
+          dotnet test tests/WordStat.Tests/WordStat.Tests.csproj \
+            -p:CollectCoverage=true -p:Threshold=100 \
+            -p:ThresholdType=\"line,branch\" -p:ThresholdStat=total
+
+      - name: Commit changes
+        run: |
+          git config user.name "ai-improve-bot"
+          git config user.email "ai-improve-bot@users.noreply.github.com"
+          git add src tests
+          if git diff --cached --quiet; then
+            echo "No changes produced by ai_improve.py -- aborting before push/PR." >&2
+            exit 1
+          fi
+          git commit -m "ai(gemini-3.5-flash-lite): ${{ inputs.instruction }}"
+          git push origin "$BRANCH"
+          echo "local commits ahead of $BASE_BRANCH: $(git rev-list --count "$BASE_BRANCH".."$BRANCH")"
+
+      - name: Wait for GitHub to index the new branch, then open PR for human approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in $(seq 1 10); do
+            if gh api "repos/${{ github.repository }}/branches/$BRANCH" \
+                 --jq '.commit.sha' > /tmp/head_sha.txt 2>/dev/null \
+               && [ -s /tmp/head_sha.txt ]; then
+              echo "branch $BRANCH visible via API with sha $(cat /tmp/head_sha.txt) (attempt $i)"
+              break
+            fi
+            echo "branch $BRANCH not yet visible via API, retrying ($i/10)..."
+            sleep 3
+          done
+
+          if ! [ -s /tmp/head_sha.txt ]; then
+            echo "error: branch $BRANCH never became visible via the GitHub API after push." >&2
+            exit 1
+          fi
+
+          summary=$(grep -E "baseline:|benchmark:|attempt " ai_improve_log.txt || true)
+          gh pr create \
+            --title "AI improvement (gemini-3.5-flash-lite): ${{ inputs.instruction }}" \
+            --body "$(printf 'Automated change proposed by Gemini (gemini-3.5-flash-lite, free tier REST API).\n\nSelf-heal log:\n```\n%s\n```\n\nThis PR requires manual human review and approval before merge. No auto-merge is configured.' "$summary")" \
+            --base "$BASE_BRANCH" \
+            --head "$BRANCH"

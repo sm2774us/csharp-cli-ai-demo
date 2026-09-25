@@ -1,0 +1,209 @@
+name: changelog-release
+
+# Manual gate: triggered by a human typing a PR number into the Actions
+# "Run workflow" form. Merges that PR to the default branch, then
+# generates a changelog entry and a semver tag. No AI is involved --
+# releases are deterministic on purpose.
+#
+# IMPORTANT: with branch protection enabled, this workflow can no
+# longer push the CHANGELOG.md commit straight to the default branch
+# ("Changes must be made through a pull request" -- the protection
+# working exactly as intended). So this now runs in two phases across
+# two runs, using the same PR-review flow as everything else in this
+# repo:
+#
+#   PHASE 1 (this run): merges your feature PR if needed, computes the
+#   next version, writes the changelog entry on its OWN branch
+#   (chore/changelog-vX.Y.Z), pushes that branch, and STOPS -- printing
+#   the exact open-pr.yml command to open a PR for it. No tag, no
+#   release yet.
+#
+#   You then run: gh workflow run open-pr.yml -f branch=chore/changelog-vX.Y.Z
+#   ...review and approve that PR same as any other, and merge it.
+#
+#   PHASE 2 (re-run this workflow with the SAME pr_number and bump):
+#   detects the changelog entry is now on the default branch, tags that
+#   commit, pushes the tag, and creates the GitHub Release. Safe to
+#   re-run before phase 2 is ready -- it just re-prints the phase 1
+#   instructions again.
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to merge into the default branch and release"
+        required: true
+      bump:
+        description: "Version bump type (use the SAME value across both phases)"
+        required: true
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # github.ref_name is the branch this workflow runs against --
+      # whatever it's actually named -- rather than a hardcoded "main"
+      # assumption (plain `git init` still defaults to "master" unless
+      # init.defaultBranch is configured, so this can't be assumed).
+      - name: Detect base branch
+        run: echo "BASE_BRANCH=${{ github.ref_name }}" >> "$GITHUB_ENV"
+
+      # Supports two flows for the ORIGINAL feature PR:
+      #   1) You reviewed, approved, and merged it yourself already --
+      #      this run just detects that and skips straight past.
+      #   2) It's still open and approved but not yet merged -- this
+      #      step merges it. No --admin flag: branch protection
+      #      (required review + passing CI) still blocks this if it
+      #      hasn't actually been approved by a human yet.
+      - name: Merge the feature PR if it isn't already merged
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          state=$(gh pr view ${{ inputs.pr_number }} --json state,mergedAt -q '.state')
+          if [ "$state" = "MERGED" ]; then
+            echo "PR #${{ inputs.pr_number }} is already merged -- skipping merge, proceeding to release."
+          elif [ "$state" = "OPEN" ]; then
+            echo "PR #${{ inputs.pr_number }} is open -- attempting merge (requires an existing approval)."
+            gh pr merge ${{ inputs.pr_number }} --merge
+          else
+            echo "PR #${{ inputs.pr_number }} is $state (not open, not merged) -- nothing to release." >&2
+            exit 1
+          fi
+
+      - name: Pull merged changes
+        run: git pull origin "$BASE_BRANCH"
+
+      - name: Compute next semantic version
+        id: version
+        run: |
+          latest_tag=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$latest_tag" ]; then
+            latest_tag="v0.0.0"
+          fi
+          IFS='.' read -r major minor patch <<< "${latest_tag#v}"
+          case "${{ inputs.bump }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          new_tag="v${major}.${minor}.${patch}"
+          echo "new_tag=$new_tag" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Stop if this version was already fully released
+        run: |
+          if git rev-parse -q --verify "refs/tags/${{ steps.version.outputs.new_tag }}" > /dev/null; then
+            echo "${{ steps.version.outputs.new_tag }} is already tagged -- nothing to do. Done."
+            echo "SKIP_REST=true" >> "$GITHUB_ENV"
+          else
+            echo "SKIP_REST=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check whether the changelog entry is already on the default branch
+        if: env.SKIP_REST == 'false'
+        run: |
+          if grep -q "^## ${{ steps.version.outputs.new_tag }} " CHANGELOG.md 2>/dev/null; then
+            echo "changelog entry for ${{ steps.version.outputs.new_tag }} already on $BASE_BRANCH -- ready to tag+release."
+            echo "PHASE=2" >> "$GITHUB_ENV"
+          else
+            echo "no changelog entry for ${{ steps.version.outputs.new_tag }} yet -- need to open that PR first."
+            echo "PHASE=1" >> "$GITHUB_ENV"
+          fi
+
+      # ---------------- PHASE 1: write the changelog on its own branch ----------------
+      - name: "Phase 1: generate changelog section from commit log"
+        if: env.SKIP_REST == 'false' && env.PHASE == '1'
+        run: |
+          previous_tag="${{ steps.version.outputs.previous_tag }}"
+          if git rev-parse -q --verify "refs/tags/$previous_tag" > /dev/null; then
+            range="$previous_tag..HEAD"
+          else
+            # No real previous tag exists yet (first-ever release) --
+            # "v0.0.0" is only a sentinel for version arithmetic above,
+            # never an actual git ref, so a "v0.0.0..HEAD" range fails
+            # with "bad revision". Fall back to the full history.
+            echo "no previous tag '$previous_tag' found -- using full history for this first release"
+            range="HEAD"
+          fi
+
+          {
+            echo "## ${{ steps.version.outputs.new_tag }} - $(date +%Y-%m-%d)"
+            echo
+            git log "$range" \
+              --pretty=format:"- %s (%h)" -- . ':!CHANGELOG.md'
+            echo
+            echo
+          } > /tmp/new_section.md
+
+          touch CHANGELOG.md
+          cat /tmp/new_section.md CHANGELOG.md > /tmp/full_changelog.md
+          mv /tmp/full_changelog.md CHANGELOG.md
+
+      - name: "Phase 1: push the changelog branch (never pushes to the protected default branch directly)"
+        if: env.SKIP_REST == 'false' && env.PHASE == '1'
+        run: |
+          changelog_branch="chore/changelog-${{ steps.version.outputs.new_tag }}"
+          echo "CHANGELOG_BRANCH=$changelog_branch" >> "$GITHUB_ENV"
+
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git checkout -b "$changelog_branch"
+          git add CHANGELOG.md
+          git commit -m "chore(release): ${{ steps.version.outputs.new_tag }}"
+          git push origin "$changelog_branch"
+
+      - name: "Phase 1: print next steps (open-pr.yml, then re-run this workflow)"
+        if: env.SKIP_REST == 'false' && env.PHASE == '1'
+        run: |
+          cat <<EOF
+
+          ==================================================================
+          Changelog entry for ${{ steps.version.outputs.new_tag }} is ready
+          on branch '$CHANGELOG_BRANCH', pushed. Branch protection means
+          this workflow can't push it straight to $BASE_BRANCH -- open a
+          PR for it the same way as any hand-written change:
+
+            gh workflow run open-pr.yml -f branch=$CHANGELOG_BRANCH -f title="chore(release): ${{ steps.version.outputs.new_tag }}"
+
+          Then review and merge it as usual:
+
+            gh pr review <number> --approve
+            gh pr merge <number> --squash
+
+          Once that's merged, re-run THIS workflow with the same inputs
+          to tag the release and publish it:
+
+            gh workflow run changelog-release.yml -f pr_number=${{ inputs.pr_number }} -f bump=${{ inputs.bump }}
+          ==================================================================
+          EOF
+
+      # ---------------- PHASE 2: the changelog PR is merged -- tag + release ----------------
+      - name: "Phase 2: extract this version's release notes from CHANGELOG.md"
+        if: env.SKIP_REST == 'false' && env.PHASE == '2'
+        run: |
+          awk -v tag="## ${{ steps.version.outputs.new_tag }} " '
+            $0 ~ "^" tag { found=1; print; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/release_notes.md
+          cat /tmp/release_notes.md
+
+      - name: "Phase 2: tag the release commit and publish"
+        if: env.SKIP_REST == 'false' && env.PHASE == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag "${{ steps.version.outputs.new_tag }}"
+          git push origin "${{ steps.version.outputs.new_tag }}"
+          gh release create "${{ steps.version.outputs.new_tag }}" \
+            --title "${{ steps.version.outputs.new_tag }}" \
+            --notes-file /tmp/release_notes.md

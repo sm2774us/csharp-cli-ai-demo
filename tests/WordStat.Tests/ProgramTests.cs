@@ -193,4 +193,3 @@ public class ProgramTests {
     Assert.Contains("error:", writer.ToString());
   }
 }
-
